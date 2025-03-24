@@ -35,43 +35,41 @@ class CivitAIImageFetcher:
         self.civitai_api_url = civitai_api_url
         self.rest_endpoint = rest_endpoint
         self.nsfw_filter = nsfw_filter
-        self.current_page = 1
-        self.has_more_pages = True
+        self.current_cursor = None
         self.processed_urls = set()  # Keep track of processed URLs to avoid duplicates
         self.batch_size = 20  # Number of images to fetch per API call
         
     def fetch_images_batch(self):
-        """Fetch a batch of images from CivitAI"""
+        """Fetch a batch of images from CivitAI using cursor-based pagination"""
         params = {
             'limit': self.batch_size,
             'sort': 'Most Reactions',
             'period': 'Day',
-            'nsfw': not self.nsfw_filter,
-            'page': self.current_page
+            'nsfw': not self.nsfw_filter
         }
+        
+        # Add cursor if we have one
+        if self.current_cursor:
+            params['cursor'] = self.current_cursor
+            logging.info(f"Using cursor: {self.current_cursor}")
+        else:
+            logging.info("Starting from the beginning (no cursor)")
         
         for _ in range(MAX_RETRIES):
             try:
-                logging.info(f"Fetching page {self.current_page} from CivitAI API")
                 response = requests.get(self.civitai_api_url, params=params)
                 response.raise_for_status()
                 
                 data = response.json()
                 
-                # Check if we have metadata about pagination
-                if 'metadata' in data:
-                    metadata = data['metadata']
-                    total_pages = metadata.get('totalPages', 1)
-                    logging.info(f"Current page: {self.current_page}, Total pages: {total_pages}")
-                    
-                    # Check if we've reached the end
-                    if self.current_page >= total_pages:
-                        logging.info("Reached the last page, resetting to page 1")
-                        self.current_page = 1
-                        self.has_more_pages = False
-                    else:
-                        self.has_more_pages = True
-                        self.current_page += 1
+                # Extract next cursor from metadata if available
+                if 'metadata' in data and 'nextCursor' in data['metadata']:
+                    self.current_cursor = data['metadata']['nextCursor']
+                    logging.info(f"Next cursor: {self.current_cursor}")
+                else:
+                    # If no next cursor, we've reached the end - reset
+                    logging.info("No next cursor found, resetting to beginning")
+                    self.current_cursor = None
                 
                 if 'items' in data and len(data['items']) > 0:
                     # Return all image URLs from this batch
@@ -88,8 +86,7 @@ class CivitAIImageFetcher:
                         logging.warning("No new images found in this batch")
                 else:
                     logging.warning("No images found in the API response")
-                    self.has_more_pages = False
-                    self.current_page = 1
+                    self.current_cursor = None  # Reset cursor
                 
                 # If we reach here with an empty list, we'll return an empty list
                 return []
@@ -124,20 +121,19 @@ class CivitAIImageFetcher:
         """Process a batch of images"""
         logging.info("Starting image fetch and send process")
         
-        # If we've processed all pages, reset to first page
-        if not self.has_more_pages:
-            self.current_page = 1
-            self.has_more_pages = True
-            # Clear processed URLs if the set is getting large
-            if len(self.processed_urls) > 1000:
-                logging.info("Clearing processed URLs cache")
-                self.processed_urls.clear()
+        # Periodically clear processed URLs to prevent memory issues
+        if len(self.processed_urls) > 1000:
+            logging.info("Clearing processed URLs cache")
+            self.processed_urls.clear()
         
         # Fetch a batch of images
         image_urls = self.fetch_images_batch()
         
         if not image_urls:
             logging.warning("No images found to process")
+            # If no images and we're already at the beginning (no cursor), just wait for next run
+            if not self.current_cursor:
+                logging.info("No more images available, waiting until next scheduled run")
             return
         
         # Process one random image from the batch
